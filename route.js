@@ -1,40 +1,47 @@
-import { getSupabase } from "@/lib/supabase";
-
+// Server-side proxy: PVGIS does not allow direct browser requests (CORS).
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  const supabase = getSupabase();
-  if (!supabase) return Response.json({ configured: false, rows: [] });
-  const { data, error } = await supabase
-    .from("calculations")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(10);
-  if (error) return Response.json({ configured: true, rows: [], error: error.message }, { status: 500 });
-  return Response.json({ configured: true, rows: data });
+function num(v, min, max) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
 }
 
-export async function POST(request) {
-  const supabase = getSupabase();
-  if (!supabase) {
-    return Response.json({ error: "ยังไม่ได้ตั้งค่า Supabase" }, { status: 503 });
+export async function GET(request) {
+  const p = new URL(request.url).searchParams;
+  const lat = num(p.get("lat"), -90, 90);
+  const lon = num(p.get("lon"), -180, 180);
+  const kwp = num(p.get("kwp"), 0.1, 10000);
+  const loss = num(p.get("loss") ?? 14, 0, 100);
+  const angle = num(p.get("angle") ?? 15, 0, 90);
+  const aspect = num(p.get("aspect") ?? 0, -180, 180);
+  if ([lat, lon, kwp, loss, angle, aspect].some((v) => v === null)) {
+    return Response.json({ error: "ค่าที่กรอกไม่ถูกต้อง" }, { status: 400 });
   }
-  const b = await request.json().catch(() => null);
-  const required = ["lat", "lon", "kwp", "annual_kwh"];
-  if (!b || required.some((k) => !Number.isFinite(Number(b[k])))) {
-    return Response.json({ error: "ข้อมูลไม่ครบ" }, { status: 400 });
+
+  const qs = new URLSearchParams({
+    lat: String(lat), lon: String(lon), peakpower: String(kwp),
+    loss: String(loss), angle: String(angle), aspect: String(aspect),
+    outputformat: "json",
+  });
+
+  try {
+    const res = await fetch(`https://re.jrc.ec.europa.eu/api/v5_3/PVcalc?${qs}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(20000),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.outputs) {
+      const msg = data?.message || `PVGIS ตอบกลับ ${res.status}`;
+      return Response.json({ error: msg }, { status: 502 });
+    }
+    const monthly = (data.outputs.monthly?.fixed ?? []).map((m) => ({
+      month: m.month,
+      kwh: m.E_m,
+    }));
+    const annualKwh = data.outputs.totals?.fixed?.E_y ??
+      monthly.reduce((s, m) => s + m.kwh, 0);
+    return Response.json({ annualKwh, monthly });
+  } catch (e) {
+    return Response.json({ error: "เชื่อมต่อ PVGIS ไม่ได้ ลองใหม่อีกครั้ง" }, { status: 502 });
   }
-  const row = {
-    name: String(b.name ?? "").slice(0, 100) || null,
-    lat: Number(b.lat),
-    lon: Number(b.lon),
-    kwp: Number(b.kwp),
-    annual_kwh: Number(b.annual_kwh),
-    system_cost: Number.isFinite(Number(b.system_cost)) ? Number(b.system_cost) : null,
-    yearly_saving: Number.isFinite(Number(b.yearly_saving)) ? Number(b.yearly_saving) : null,
-    payback_years: Number.isFinite(Number(b.payback_years)) ? Number(b.payback_years) : null,
-  };
-  const { error } = await supabase.from("calculations").insert(row);
-  if (error) return Response.json({ error: error.message }, { status: 500 });
-  return Response.json({ ok: true });
 }
